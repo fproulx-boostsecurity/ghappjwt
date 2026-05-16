@@ -93,6 +93,10 @@ Useful options:
 --override disabled    # only force classic opaque format
 --override both        # default
 --override absent      # no override header
+--attempts 12          # repeat each requested override
+--delay-seconds 5      # wait between attempts
+--stop-on-jwt          # stop early once a JWT-shaped installation token appears
+--classify-token-env ACTIONS_GITHUB_TOKEN
 --api-version 2026-03-10
 --output capture-output.json
 ```
@@ -108,6 +112,17 @@ workflow_dispatch  on demand, defaults to override=enabled
 schedule           every 15 minutes
 issues.opened      comments the sanitized result on the opened issue
 ```
+
+The workflow checks two token sources:
+
+```text
+custom GitHub App installation token  created by POST /app/installations/:id/access_tokens
+Actions GITHUB_TOKEN                  provided to the capture job with permissions: read-all
+```
+
+The workflow intentionally fails if neither source is JWT-shaped. Failed runs mean both sources still returned the classic opaque format. The first successful run is the one that caught the new format from at least one source.
+
+The issue comment does not include live bearer tokens. When a JWT-shaped token appears, the comment includes decoded header/payload, signature length, SHA-256 fingerprint, and a compact JWT specimen with the signature removed.
 
 Required repository secrets:
 
@@ -135,6 +150,13 @@ absent    omit the override header
 ```
 
 For on-demand hunting of the new token format, use `workflow_dispatch` with `override=enabled`. Optionally pass `comment_issue_number` to post the sanitized report to an existing issue.
+
+Manual runs also support:
+
+```text
+attempts       number of requests to make for the selected override
+delay_seconds  pause between attempts
+```
 
 ## Local App Auth JWT Shape
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -41,6 +42,10 @@ class Config:
     override: str
     output: Path | None
     timeout: int
+    attempts: int
+    delay_seconds: float
+    stop_on_jwt: bool
+    classify_token_env: list[str]
 
 
 def b64url_encode(raw: bytes) -> str:
@@ -90,6 +95,44 @@ def resolve_value(
     return default
 
 
+def resolve_list(
+    name: str,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    env_name: str,
+) -> list[str]:
+    cli_value = getattr(args, name)
+    if cli_value:
+        return [str(item) for item in cli_value]
+
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return [item.strip() for item in env_value.split(",") if item.strip()]
+
+    config_value = config.get(name)
+    if isinstance(config_value, list):
+        return [str(item) for item in config_value if str(item)]
+    if isinstance(config_value, str) and config_value:
+        return [item.strip() for item in config_value.split(",") if item.strip()]
+
+    return []
+
+
+def parse_bool(value: str | bool | None, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+
+    raise SystemExit(f"Invalid boolean value: {value}")
+
+
 def parse_args(argv: list[str]) -> Config:
     parser = argparse.ArgumentParser(
         description="Capture GitHub App installation token format behavior."
@@ -110,6 +153,25 @@ def parse_args(argv: list[str]) -> Config:
         help="Optional path for sanitized JSON report. Full tokens are never written.",
     )
     parser.add_argument("--timeout", type=int, help="HTTP timeout in seconds")
+    parser.add_argument("--attempts", type=int, help="Requests to make per override")
+    parser.add_argument(
+        "--delay-seconds",
+        dest="delay_seconds",
+        type=float,
+        help="Delay between attempts",
+    )
+    parser.add_argument(
+        "--stop-on-jwt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop early when a JWT-shaped installation token is observed",
+    )
+    parser.add_argument(
+        "--classify-token-env",
+        action="append",
+        default=[],
+        help="Classify a token from this environment variable without printing it",
+    )
 
     args = parser.parse_args(argv)
     config_path = Path(args.config)
@@ -128,6 +190,16 @@ def parse_args(argv: list[str]) -> Config:
     )
     override = resolve_value("override", args, config, "GHAPPJWT_OVERRIDE", "both")
     timeout_raw = resolve_value("timeout", args, config, "GHAPPJWT_TIMEOUT", "30")
+    attempts_raw = resolve_value("attempts", args, config, "GHAPPJWT_ATTEMPTS", "1")
+    delay_seconds_raw = resolve_value(
+        "delay_seconds", args, config, "GHAPPJWT_DELAY_SECONDS", "0"
+    )
+    stop_on_jwt_raw = resolve_value(
+        "stop_on_jwt", args, config, "GHAPPJWT_STOP_ON_JWT", "true"
+    )
+    classify_token_env = resolve_list(
+        "classify_token_env", args, config, "GHAPPJWT_CLASSIFY_TOKEN_ENV"
+    )
     output = resolve_value("output", args, config, "GHAPPJWT_OUTPUT")
 
     missing = [
@@ -154,6 +226,22 @@ def parse_args(argv: list[str]) -> Config:
     except ValueError as exc:
         raise SystemExit("timeout must be an integer") from exc
 
+    try:
+        attempts = int(attempts_raw or "1")
+    except ValueError as exc:
+        raise SystemExit("attempts must be an integer") from exc
+    if attempts < 1:
+        raise SystemExit("attempts must be at least 1")
+
+    try:
+        delay_seconds = float(delay_seconds_raw or "0")
+    except ValueError as exc:
+        raise SystemExit("delay-seconds must be a number") from exc
+    if delay_seconds < 0:
+        raise SystemExit("delay-seconds must not be negative")
+
+    stop_on_jwt = parse_bool(stop_on_jwt_raw, default=True)
+
     return Config(
         app_id=str(app_id),
         installation_id=str(installation_id),
@@ -163,6 +251,10 @@ def parse_args(argv: list[str]) -> Config:
         override=str(override),
         output=Path(output).expanduser() if output else None,
         timeout=timeout,
+        attempts=attempts,
+        delay_seconds=delay_seconds,
+        stop_on_jwt=stop_on_jwt,
+        classify_token_env=classify_token_env,
     )
 
 
@@ -196,7 +288,7 @@ def make_app_jwt(app_id: str, private_key_path: Path) -> tuple[str, dict[str, An
 
 def request_installation_token(
     cfg: Config, app_jwt: str, override: str | None
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, dict[str, Any], dict[str, str]]:
     url = f"{cfg.api_url}/app/installations/{cfg.installation_id}/access_tokens"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -212,21 +304,47 @@ def request_installation_token(
     try:
         with urllib.request.urlopen(request, timeout=cfg.timeout) as response:
             body = response.read().decode("utf-8")
-            return response.status, json.loads(body) if body else {}
+            return (
+                response.status,
+                json.loads(body) if body else {},
+                safe_response_headers(response.headers),
+            )
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8")
         try:
             parsed = json.loads(body) if body else {}
         except json.JSONDecodeError:
             parsed = {"raw_body": body}
-        return exc.code, parsed
+        return exc.code, parsed, safe_response_headers(exc.headers)
     except urllib.error.URLError as exc:
         raise SystemExit(f"Network error calling GitHub API: {exc}") from exc
+
+
+def safe_response_headers(headers: Any) -> dict[str, str]:
+    keep = {
+        "date",
+        "x-github-api-version-selected",
+        "x-github-request-id",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-resource",
+        "x-ratelimit-used",
+    }
+    safe: dict[str, str] = {}
+
+    for key in keep:
+        value = headers.get(key)
+        if value is not None:
+            safe[key] = str(value)
+
+    return safe
 
 
 def classify_token(token: str) -> dict[str, Any]:
     without_prefix = token.removeprefix("ghs_")
     segments = without_prefix.split(".")
+    has_ghs_prefix = token.startswith("ghs_")
     regex_match = token.startswith("ghs_") and len(token) >= 40 and all(
         char.isalnum() or char in "._" for char in token[4:]
     )
@@ -235,10 +353,9 @@ def classify_token(token: str) -> dict[str, Any]:
         "prefix": token[:4],
         "length": len(token),
         "dots_after_prefix": without_prefix.count("."),
-        "jwt_like": len(segments) == 3,
+        "jwt_like": has_ghs_prefix and len(segments) == 3,
         "recommended_regex_match": regex_match,
         "recommended_regex": TOKEN_PATTERN_NOTE,
-        "redacted": f"{token[:12]}...{token[-8:]}",
     }
 
 
@@ -261,20 +378,67 @@ def decode_ghs_jwt(token: str) -> dict[str, Any] | None:
         return None
 
 
+def redacted_jwt_specimen(token: str) -> dict[str, str] | None:
+    without_prefix = token.removeprefix("ghs_")
+    segments = without_prefix.split(".")
+    if len(segments) != 3:
+        return None
+
+    specimen = f"ghs_{segments[0]}.{segments[1]}.[signature-redacted]"
+    return {
+        "format": "compact-jwt-signature-redacted",
+        "value": specimen,
+        "note": "Signature is removed; this is not a usable token.",
+    }
+
+
+def token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def sanitize_error_body(body: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in body.items() if key != "token"}
 
 
-def summarize_response(label: str, status: int, body: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {"request": label, "http_status": status}
+def summarize_existing_token(source: str, token: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "source": source,
+        "token": classify_token(token),
+        "sha256": token_fingerprint(token),
+    }
+    decoded = decode_ghs_jwt(token)
+    result["decoded_jwt"] = decoded if decoded else "not JWT-shaped"
+    specimen = redacted_jwt_specimen(token)
+    if specimen:
+        result["redacted_jwt_specimen"] = specimen
+    return result
+
+
+def summarize_response(
+    label: str,
+    attempt: int,
+    status: int,
+    body: dict[str, Any],
+    response_headers: dict[str, str],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "request": label,
+        "attempt": attempt,
+        "http_status": status,
+        "response_headers": response_headers,
+    }
     token = body.get("token")
     if not isinstance(token, str):
         result["body"] = sanitize_error_body(body)
         return result
 
     result["token"] = classify_token(token)
+    result["sha256"] = token_fingerprint(token)
     decoded = decode_ghs_jwt(token)
     result["decoded_jwt"] = decoded if decoded else "not JWT-shaped"
+    specimen = redacted_jwt_specimen(token)
+    if specimen:
+        result["redacted_jwt_specimen"] = specimen
     expires_at = body.get("expires_at")
     if expires_at:
         result["expires_at"] = expires_at
@@ -292,6 +456,7 @@ def overrides_to_run(value: str) -> list[str | None]:
 def main(argv: list[str]) -> int:
     cfg = parse_args(argv)
     app_jwt, jwt_shape = make_app_jwt(cfg.app_id, cfg.private_key)
+    app_jwt_exp = jwt_shape["payload"]["exp"]
 
     report: dict[str, Any] = {
         "captured_at": datetime.now(UTC).isoformat(),
@@ -303,17 +468,68 @@ def main(argv: list[str]) -> int:
             "api_version": cfg.api_version,
         },
         "app_auth_jwt": jwt_shape,
+        "capture_options": {
+            "override": cfg.override,
+            "attempts": cfg.attempts,
+            "delay_seconds": cfg.delay_seconds,
+            "stop_on_jwt": cfg.stop_on_jwt,
+            "classify_token_env": cfg.classify_token_env,
+        },
         "results": [],
+        "provided_tokens": [],
     }
 
-    for override in overrides_to_run(cfg.override):
-        label = (
-            "X-GitHub-Stateless-S2S-Token: absent"
-            if override is None
-            else f"X-GitHub-Stateless-S2S-Token: {override}"
-        )
-        status, body = request_installation_token(cfg, app_jwt, override)
-        report["results"].append(summarize_response(label, status, body))
+    jwt_like_found = False
+    for attempt in range(1, cfg.attempts + 1):
+        for override in overrides_to_run(cfg.override):
+            if int(time.time()) >= app_jwt_exp - 60:
+                app_jwt, jwt_shape = make_app_jwt(cfg.app_id, cfg.private_key)
+                app_jwt_exp = jwt_shape["payload"]["exp"]
+
+            label = (
+                "X-GitHub-Stateless-S2S-Token: absent"
+                if override is None
+                else f"X-GitHub-Stateless-S2S-Token: {override}"
+            )
+            status, body, response_headers = request_installation_token(
+                cfg, app_jwt, override
+            )
+            result = summarize_response(label, attempt, status, body, response_headers)
+            report["results"].append(result)
+
+            token = result.get("token")
+            if isinstance(token, dict) and token.get("jwt_like"):
+                jwt_like_found = True
+                if cfg.stop_on_jwt:
+                    break
+
+        if jwt_like_found and cfg.stop_on_jwt:
+            break
+
+        if attempt < cfg.attempts and cfg.delay_seconds:
+            time.sleep(cfg.delay_seconds)
+
+    report["jwt_like_installation_token_found"] = jwt_like_found
+
+    provided_token_jwt_like_found = False
+    for env_name in cfg.classify_token_env:
+        token = os.environ.get(env_name)
+        if not token:
+            report["provided_tokens"].append(
+                {"source": env_name, "error": "environment variable was empty or unset"}
+            )
+            continue
+
+        provided = summarize_existing_token(env_name, token)
+        report["provided_tokens"].append(provided)
+        token_summary = provided.get("token")
+        if isinstance(token_summary, dict) and token_summary.get("jwt_like"):
+            provided_token_jwt_like_found = True
+
+    report["jwt_like_provided_token_found"] = provided_token_jwt_like_found
+    report["jwt_like_token_found"] = (
+        jwt_like_found or provided_token_jwt_like_found
+    )
 
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
