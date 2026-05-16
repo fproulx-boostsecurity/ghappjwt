@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +294,7 @@ def main(argv: list[str]) -> int:
     app_jwt, jwt_shape = make_app_jwt(cfg.app_id, cfg.private_key)
 
     report: dict[str, Any] = {
+        "captured_at": datetime.now(UTC).isoformat(),
         "app": {
             "app_id": cfg.app_id,
             "installation_id": cfg.installation_id,
