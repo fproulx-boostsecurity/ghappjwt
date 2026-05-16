@@ -1,0 +1,6 @@
+.env
+.ghappjwt.json
+__pycache__/
+*.pem
+*.key
+capture-output*.json
