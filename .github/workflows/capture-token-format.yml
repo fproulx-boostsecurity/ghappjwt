@@ -119,15 +119,16 @@ jobs:
         if: github.event_name == 'issues' && hashFiles('capture-report.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue comment "${{ github.event.issue.number }}" --body-file capture-report.md
+        run: gh issue comment "${{ github.event.issue.number }}" --repo "${GITHUB_REPOSITORY}" --body-file capture-report.md
 
       - name: Comment on requested issue
         if: github.event_name == 'workflow_dispatch' && inputs.comment_issue_number != '' && hashFiles('capture-report.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue comment "${{ inputs.comment_issue_number }}" --body-file capture-report.md
+        run: gh issue comment "${{ inputs.comment_issue_number }}" --repo "${GITHUB_REPOSITORY}" --body-file capture-report.md
 
       - name: Fail unless new token format was observed
+        if: always()
         run: |
           if [ "${{ needs.capture.outputs.jwt_like_token_found }}" != "true" ]; then
             echo "No JWT-shaped token observed." >&2
