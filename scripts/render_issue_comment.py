@@ -38,16 +38,21 @@ def result_section(result: dict[str, Any]) -> list[str]:
             f"- Prefix: {code(token.get('prefix'))}",
             f"- Length: {code(token.get('length'))}",
             f"- Dots after `ghs_`: {code(token.get('dots_after_prefix'))}",
+            f"- Token format: {code(token.get('token_format'))}",
             f"- JWT-like: {code(token.get('jwt_like'))}",
             f"- Compatible with recommended regex: {code(token.get('recommended_regex_match'))}",
         ]
     )
+    if token.get("embedded_app_id"):
+        lines.append(f"- Embedded App ID: {code(token.get('embedded_app_id'))}")
     if result.get("sha256"):
         lines.append(f"- SHA-256: {code(result.get('sha256'))}")
 
     decoded = result.get("decoded_jwt")
     if isinstance(decoded, dict):
         safe_decoded = {
+            "token_format": decoded.get("token_format"),
+            "embedded_app_id": decoded.get("embedded_app_id"),
             "header": decoded.get("header"),
             "payload": decoded.get("payload"),
             "signature": decoded.get("signature"),
@@ -96,16 +101,21 @@ def provided_token_section(result: dict[str, Any]) -> list[str]:
             f"- Prefix: {code(token.get('prefix'))}",
             f"- Length: {code(token.get('length'))}",
             f"- Dots after `ghs_`: {code(token.get('dots_after_prefix'))}",
+            f"- Token format: {code(token.get('token_format'))}",
             f"- JWT-like: {code(token.get('jwt_like'))}",
             f"- Compatible with recommended regex: {code(token.get('recommended_regex_match'))}",
         ]
     )
+    if token.get("embedded_app_id"):
+        lines.append(f"- Embedded App ID: {code(token.get('embedded_app_id'))}")
     if result.get("sha256"):
         lines.append(f"- SHA-256: {code(result.get('sha256'))}")
 
     decoded = result.get("decoded_jwt")
     if isinstance(decoded, dict):
         safe_decoded = {
+            "token_format": decoded.get("token_format"),
+            "embedded_app_id": decoded.get("embedded_app_id"),
             "header": decoded.get("header"),
             "payload": decoded.get("payload"),
             "signature": decoded.get("signature"),

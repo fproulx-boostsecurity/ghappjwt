@@ -27,12 +27,14 @@ X-GitHub-Stateless-S2S-Token: disabled  -> request classic opaque token
 header absent or any other value         -> normal rollout behavior
 ```
 
-Expected token shape from the changelog:
+Expected token shape from the changelogs:
 
 ```text
-stateless: ghs_ prefix, JWT-like, two dots after ghs_, roughly 520 chars
+stateless: ghs_APPID_JWT, roughly 520 chars, JWT portion has two dots
 stateful:  ghs_ prefix, opaque, no dots, shorter
 ```
+
+The `APPID` component is the numeric GitHub App ID embedded between `ghs_` and the JWT. The JWT itself is still opaque to clients; the CLI decodes it only to capture rollout evidence.
 
 GitHub's recommended matcher for accepting both formats:
 

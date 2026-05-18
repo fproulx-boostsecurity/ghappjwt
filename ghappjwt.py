@@ -341,27 +341,7 @@ def safe_response_headers(headers: Any) -> dict[str, str]:
     return safe
 
 
-def classify_token(token: str) -> dict[str, Any]:
-    without_prefix = token.removeprefix("ghs_")
-    segments = without_prefix.split(".")
-    has_ghs_prefix = token.startswith("ghs_")
-    regex_match = token.startswith("ghs_") and len(token) >= 40 and all(
-        char.isalnum() or char in "._" for char in token[4:]
-    )
-
-    return {
-        "prefix": token[:4],
-        "length": len(token),
-        "dots_after_prefix": without_prefix.count("."),
-        "jwt_like": has_ghs_prefix and len(segments) == 3,
-        "recommended_regex_match": regex_match,
-        "recommended_regex": TOKEN_PATTERN_NOTE,
-    }
-
-
-def decode_ghs_jwt(token: str) -> dict[str, Any] | None:
-    without_prefix = token.removeprefix("ghs_")
-    segments = without_prefix.split(".")
+def decode_jwt_segments(segments: list[str]) -> dict[str, Any] | None:
     if len(segments) != 3:
         return None
 
@@ -378,13 +358,94 @@ def decode_ghs_jwt(token: str) -> dict[str, Any] | None:
         return None
 
 
-def redacted_jwt_specimen(token: str) -> dict[str, str] | None:
+def parse_ghs_token(token: str) -> dict[str, Any]:
+    if not token.startswith("ghs_"):
+        return {
+            "token_format": "unknown",
+            "jwt_segments": None,
+            "embedded_app_id": None,
+            "decoded_jwt": None,
+        }
+
+    body = token.removeprefix("ghs_")
+
+    direct_segments = body.split(".")
+    direct_decoded = decode_jwt_segments(direct_segments)
+    if direct_decoded:
+        return {
+            "token_format": "ghs_jwt",
+            "jwt_segments": direct_segments,
+            "embedded_app_id": None,
+            "decoded_jwt": direct_decoded,
+        }
+
+    app_id, separator, jwt_part = body.partition("_")
+    if separator and app_id.isdigit():
+        appid_segments = jwt_part.split(".")
+        appid_decoded = decode_jwt_segments(appid_segments)
+        if appid_decoded:
+            return {
+                "token_format": "ghs_appid_jwt",
+                "jwt_segments": appid_segments,
+                "embedded_app_id": app_id,
+                "decoded_jwt": appid_decoded,
+            }
+
+    return {
+        "token_format": "ghs_opaque",
+        "jwt_segments": None,
+        "embedded_app_id": None,
+        "decoded_jwt": None,
+    }
+
+
+def classify_token(token: str) -> dict[str, Any]:
     without_prefix = token.removeprefix("ghs_")
-    segments = without_prefix.split(".")
-    if len(segments) != 3:
+    has_ghs_prefix = token.startswith("ghs_")
+    parsed = parse_ghs_token(token)
+    regex_match = token.startswith("ghs_") and len(token) >= 40 and all(
+        char.isalnum() or char in "._" for char in token[4:]
+    )
+
+    return {
+        "prefix": token[:4],
+        "length": len(token),
+        "dots_after_prefix": without_prefix.count("."),
+        "token_format": parsed["token_format"],
+        "embedded_app_id": parsed["embedded_app_id"],
+        "jwt_like": has_ghs_prefix and parsed["jwt_segments"] is not None,
+        "recommended_regex_match": regex_match,
+        "recommended_regex": TOKEN_PATTERN_NOTE,
+    }
+
+
+def decode_ghs_jwt(token: str) -> dict[str, Any] | None:
+    parsed = parse_ghs_token(token)
+    decoded = parsed["decoded_jwt"]
+    if not decoded:
         return None
 
-    specimen = f"ghs_{segments[0]}.{segments[1]}.[signature-redacted]"
+    return {
+        "token_format": parsed["token_format"],
+        "embedded_app_id": parsed["embedded_app_id"],
+        **decoded,
+    }
+
+
+def redacted_jwt_specimen(token: str) -> dict[str, str] | None:
+    parsed = parse_ghs_token(token)
+    segments = parsed["jwt_segments"]
+    if not segments:
+        return None
+
+    if parsed["token_format"] == "ghs_appid_jwt":
+        specimen = (
+            f"ghs_{parsed['embedded_app_id']}_"
+            f"{segments[0]}.{segments[1]}.[signature-redacted]"
+        )
+    else:
+        specimen = f"ghs_{segments[0]}.{segments[1]}.[signature-redacted]"
+
     return {
         "format": "compact-jwt-signature-redacted",
         "value": specimen,
