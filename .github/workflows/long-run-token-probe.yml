@@ -1,0 +1,178 @@
+name: Long-running GITHUB_TOKEN refresh probe
+
+# Captures whether the runner-exposed GITHUB_TOKEN (now a ghs_APPID_JWT with a
+# hard 3600s exp) rotates mid-job, and whether the originally captured token
+# still authenticates past its exp. Designed to take ~75 minutes wall time.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      metadata: read
+    env:
+      PROBE_REPORT: ${{ github.workspace }}/probe-report.jsonl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Initialize report and token-file paths
+        run: |
+          set -euo pipefail
+          : > "${PROBE_REPORT}"
+          {
+            echo "ORIGINAL_TOKEN_FILE=${RUNNER_TEMP}/original-token"
+            echo "CURRENT_TOKEN_FILE=${RUNNER_TEMP}/current-token"
+          } >> "${GITHUB_ENV}"
+
+      - name: Probe T+0 (baseline)
+        env:
+          CURRENT_TOKEN: ${{ github.token }}
+          STEP_LABEL: t+0m_baseline
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${CURRENT_TOKEN}" > "${ORIGINAL_TOKEN_FILE}"
+          printf '%s' "${CURRENT_TOKEN}" > "${CURRENT_TOKEN_FILE}"
+          unset CURRENT_TOKEN
+          python scripts/long_run_probe.py
+          python - <<'PY' >> "${GITHUB_ENV}"
+          import json, os
+          line = open(os.environ["PROBE_REPORT"]).read().splitlines()[-1]
+          record = json.loads(line)
+          print(f"BASELINE_EPOCH={record['epoch']}")
+          exp = record['current_token'].get('jwt_exp')
+          if exp is not None:
+              print(f"ORIGINAL_EXP={exp}")
+          PY
+
+      - name: Assert baseline is the new stateless ghs_APPID_JWT format
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+          line = open(os.environ["PROBE_REPORT"]).read().splitlines()[-1]
+          record = json.loads(line)
+          token = record["current_token"]
+          fmt = token.get("format")
+          if fmt != "ghs_appid_jwt":
+              print(
+                  f"Baseline token format is {fmt!r}, not 'ghs_appid_jwt'. "
+                  "The stateless rollout has not reached this installation yet; "
+                  "aborting so we do not waste a 75-minute run.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          lifetime = token.get("jwt_lifetime_seconds")
+          aud = token.get("jwt_aud")
+          aid = token.get("embedded_app_id")
+          print(
+              f"Baseline confirmed: format={fmt}, embedded_app_id={aid}, "
+              f"lifetime={lifetime}s, aud={aud}."
+          )
+          PY
+
+      - name: Wait until T+30 minutes
+        run: |
+          set -euo pipefail
+          target=$(( BASELINE_EPOCH + 1800 ))
+          delta=$(( target - $(date +%s) ))
+          if [ "${delta}" -gt 0 ]; then sleep "${delta}"; fi
+
+      - name: Probe T+30
+        env:
+          CURRENT_TOKEN: ${{ github.token }}
+          STEP_LABEL: t+30m
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${CURRENT_TOKEN}" > "${CURRENT_TOKEN_FILE}"
+          unset CURRENT_TOKEN
+          python scripts/long_run_probe.py
+
+      - name: Wait until T+58 minutes
+        run: |
+          set -euo pipefail
+          target=$(( BASELINE_EPOCH + 3480 ))
+          delta=$(( target - $(date +%s) ))
+          if [ "${delta}" -gt 0 ]; then sleep "${delta}"; fi
+
+      - name: Probe T+58 (last probe before original exp)
+        env:
+          CURRENT_TOKEN: ${{ github.token }}
+          STEP_LABEL: t+58m_pre_exp
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${CURRENT_TOKEN}" > "${CURRENT_TOKEN_FILE}"
+          unset CURRENT_TOKEN
+          python scripts/long_run_probe.py
+
+      - name: Wait until T+63 minutes (3 min past original exp)
+        run: |
+          set -euo pipefail
+          target=$(( BASELINE_EPOCH + 3780 ))
+          delta=$(( target - $(date +%s) ))
+          if [ "${delta}" -gt 0 ]; then sleep "${delta}"; fi
+
+      - name: Probe T+63 (critical, just past original exp)
+        env:
+          CURRENT_TOKEN: ${{ github.token }}
+          STEP_LABEL: t+63m_post_exp
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${CURRENT_TOKEN}" > "${CURRENT_TOKEN_FILE}"
+          unset CURRENT_TOKEN
+          python scripts/long_run_probe.py
+
+      - name: Wait until T+75 minutes
+        run: |
+          set -euo pipefail
+          target=$(( BASELINE_EPOCH + 4500 ))
+          delta=$(( target - $(date +%s) ))
+          if [ "${delta}" -gt 0 ]; then sleep "${delta}"; fi
+
+      - name: Probe T+75 (final)
+        env:
+          CURRENT_TOKEN: ${{ github.token }}
+          STEP_LABEL: t+75m_final
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "${CURRENT_TOKEN}" > "${CURRENT_TOKEN_FILE}"
+          unset CURRENT_TOKEN
+          python scripts/long_run_probe.py
+
+      - name: Render summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python scripts/long_run_summary.py "${PROBE_REPORT}" > probe-summary.md
+          cat probe-summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clean up token files
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "${ORIGINAL_TOKEN_FILE}" "${CURRENT_TOKEN_FILE}" || true
+
+      - name: Upload sanitized report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-run-probe
+          path: |
+            probe-report.jsonl
+            probe-summary.md
+          retention-days: 30
