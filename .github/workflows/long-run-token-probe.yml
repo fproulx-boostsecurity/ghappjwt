@@ -15,7 +15,6 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-      metadata: read
     env:
       PROBE_REPORT: ${{ github.workspace }}/probe-report.jsonl
 
